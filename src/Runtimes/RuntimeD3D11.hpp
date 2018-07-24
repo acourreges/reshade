@@ -3,6 +3,7 @@
 #include "Runtime.hpp"
 
 #include <d3d11_1.h>
+#include <set>
 
 namespace ReShade { namespace Runtimes
 {
@@ -35,6 +36,33 @@ namespace ReShade { namespace Runtimes
 
 		virtual std::unique_ptr<Effect> CompileEffect(const EffectTree &ast, std::string &errors) const override;
 		virtual void CreateScreenshot(unsigned char *buffer, std::size_t size) const override;
+		virtual void DumpFrameTrace(const boost::filesystem::path &path) override;
+		virtual void ToggleDebugView(bool saveCurrent, bool playSave, bool playNext) override;
+		static bool mIsDumpingTrace;
+		static int mToggleDebugViewID;
+		boost::filesystem::path DumpRootPath;
+		void DumpTexture2D(boost::filesystem::path rootPathNoExt, ID3D11Texture2D* texture);
+		void DumpReadableTexture2D(boost::filesystem::path rootPathNoExt, ID3D11Texture2D* texture);
+		void OnSetMRT(UINT NumViews, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView);
+		void OnExecuteCommandList(ID3D11DeviceContext *context, ID3D11CommandList *pCommandList, BOOL RestoreContextState);
+
+		int lastMRTsCount;
+		ID3D11RenderTargetView* lastMRTs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+		ID3D11DepthStencilView* lastDepthStencil;
+		DWORD CLThread;
+
+		static std::vector<ID3D11RenderTargetView*> WatchedRTs;
+		void AddWatchRT(ID3D11RenderTargetView* rt) {
+			WatchedRTs.push_back(rt);
+			LOG(INFO) << "Added RT to watch " << rt << ". Total alive: " << WatchedRTs.size();
+		}
+		void RemoveWatchRT(ID3D11RenderTargetView* rt) {
+			LOG(INFO) << "RT released: " << rt;
+			//int deleted = WatchedRTs.erase(rt);
+			//if (deleted == 0) LOG(ERROR) << "Cannot remove a RT we were not tracking: " << rt;
+			auto it = std::find(WatchedRTs.begin(), WatchedRTs.end(), rt);
+			if (it != WatchedRTs.end()) WatchedRTs.erase(it);
+		}
 
 		ID3D11Device *mDevice;
 		ID3D11DeviceContext *mImmediateContext;

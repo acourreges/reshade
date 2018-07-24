@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_set>
 #include <typeinfo>
+#include <algorithm>
 
 namespace ReShade
 {

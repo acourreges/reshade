@@ -1,5 +1,4 @@
 #include "Log.hpp"
-#include "Version.h"
 #include "Runtime.hpp"
 #include "HookManager.hpp"
 #include "EffectPreprocessor.hpp"
@@ -17,10 +16,58 @@
 #include <boost\filesystem\operations.hpp>
 #include <nanovg.h>
 
+boost::filesystem::path GameFolderPath;
+
+int BackbufferWidth = 0;
+int BackbufferHeight = 0;
+
+float BandageTarget = 1.0f;
+float BandageCurrent = 1.0f;
+
 namespace ReShade
 {
 	namespace
 	{
+
+		// Util class to manage keyboard key press and key repeats
+		class KeyMgt
+		{
+		public:
+			int KeyCode;
+			int CoolDown;
+			int Armed;
+
+			KeyMgt(int k) {
+				KeyCode = k;
+				CoolDown = 0;
+				Armed = 0;
+			}
+
+			void Update() {
+				if (CoolDown > 0)
+				{
+					CoolDown--;
+					return;
+				}
+				Armed = ::GetAsyncKeyState(KeyCode) & 0x8000;
+			}
+
+			bool WasPressed() {
+				if (Armed) {
+					Armed = 0;
+					CoolDown = 20;
+					return true;
+				}
+				return false;
+			}
+		};
+
+		static KeyMgt F9Key(VK_F9);
+		static KeyMgt F10Key(VK_F10);
+		static KeyMgt F11Key(VK_F11);
+		static KeyMgt F12Key(VK_F12);
+		static KeyMgt SnapshotKey(VK_SNAPSHOT);
+
 		boost::filesystem::path ObfuscatePath(const boost::filesystem::path &path)
 		{
 			char username[257];
@@ -55,6 +102,7 @@ namespace ReShade
 	{
 		sInjectorPath = injectorPath;
 		sExecutablePath = executablePath;
+		GameFolderPath = executablePath;
 		sEffectPath = injectorPath;
 		sEffectPath.replace_extension("fx");
 		boost::filesystem::path systemPath = GetSystemDirectory();
@@ -85,7 +133,7 @@ namespace ReShade
 
 		el::Loggers::reconfigureLogger("default", logConfig);
 
-		LOG(INFO) << "Initializing Crosire's ReShade version '" BOOST_STRINGIZE(VERSION_FULL) "' built on '" VERSION_DATE " " VERSION_TIME "' loaded from " << ObfuscatePath(injectorPath) << " to " << ObfuscatePath(executablePath) << " ...";
+		LOG(INFO) << "Initializing Crosire's ReShade version '" BOOST_STRINGIZE(VERSION_FULL); // "' built on '" VERSION_DATE " " VERSION_TIME "' loaded from " << ObfuscatePath(injectorPath) << " to " << ObfuscatePath(executablePath) << " ...";
 
 		Hooks::Register(systemPath / "d3d8.dll");
 		Hooks::Register(systemPath / "d3d9.dll");
@@ -318,15 +366,6 @@ namespace ReShade
 		tm tm;
 		::localtime_s(&tm, &time);
 
-		// Create screenshot
-		if (::GetAsyncKeyState(VK_SNAPSHOT) & 0x8000)
-		{
-			char timeString[128];
-			std::strftime(timeString, 128, "%Y-%m-%d %H-%M-%S", &tm); 
-
-			CreateScreenshot(sExecutablePath.parent_path() / (sExecutablePath.stem().string() + ' ' + timeString + ".png"));
-		}
-
 		// Check for file modifications
 		std::vector<boost::filesystem::path> modifications;
 
@@ -455,6 +494,34 @@ namespace ReShade
 		this->mLastFrameDuration = frametime;
 		this->mLastFrameCount++;
 		this->mLastDrawCalls = this->mLastDrawCallVertices = 0;
+
+		{
+			F9Key.Update();
+			F10Key.Update();
+			F11Key.Update();
+			F12Key.Update();
+			SnapshotKey.Update();
+
+			// Overwriting the backbuffer with one of the render targets
+			ToggleDebugView(F10Key.WasPressed(), F11Key.WasPressed(), F12Key.WasPressed());
+
+			// Ishmael's bandage on/off toggle
+			if (F9Key.WasPressed()) {
+				// Invert target
+				BandageTarget *= -1.0f;
+			}
+
+			BandageCurrent += BandageTarget * 1.0f / 60.0f;
+			if (BandageCurrent < 0) BandageCurrent = 0;
+			if (BandageCurrent > 1) BandageCurrent = 1;
+
+			// Dumping all the render target with intermediate state
+			if (SnapshotKey.WasPressed()) {
+				char timeString[128];
+				std::strftime(timeString, 128, "%Y-%m-%d %H-%M-%S", &tm);
+				DumpFrameTrace(sExecutablePath.parent_path() / (sExecutablePath.stem().string() + ' ' + timeString));
+			}
+		}
 	}
 
 	bool Runtime::LoadEffect()
@@ -487,7 +554,7 @@ namespace ReShade
 
 		// Preprocess
 		EffectPreprocessor preprocessor;
-		preprocessor.AddDefine("__RESHADE__", std::to_string(VERSION_MAJOR * 10000 + VERSION_MINOR * 100 + VERSION_REVISION));
+		preprocessor.AddDefine("__RESHADE__", std::to_string(/*VERSION_MAJOR*/0 * 10000 + /*VERSION_MINOR */10 * 100 + /*VERSION_REVISION*/ 0));
 		preprocessor.AddDefine("__VENDOR__", std::to_string(this->mVendorId));
 		preprocessor.AddDefine("__DEVICE__", std::to_string(this->mDeviceId));
 		preprocessor.AddDefine("__RENDERER__", std::to_string(this->mRendererId));

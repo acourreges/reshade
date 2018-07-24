@@ -5,8 +5,24 @@
 #include <d3dcompiler.h>
 #include <nanovg_d3d11.h>
 #include <boost\algorithm\string.hpp>
+#include <boost\filesystem.hpp>
+#include <stb_dxt.h>
+#include <stb_image.h>
+#include <stb_image_write.h>
+#include <stb_image_resize.h>
 
 // -----------------------------------------------------------------------------------------------------
+extern int BackbufferWidth;
+extern int BackbufferHeight;
+
+std::vector<ID3D11RenderTargetView*> ReShade::Runtimes::D3D11Runtime::WatchedRTs;
+
+bool ReShade::Runtimes::D3D11Runtime::mIsDumpingTrace;
+int ReShade::Runtimes::D3D11Runtime::mToggleDebugViewID;
+
+int CurrentSavedView = -1;
+std::vector<int> SavedViews;
+
 
 inline bool operator ==(const D3D11_SAMPLER_DESC &left, const D3D11_SAMPLER_DESC &right)
 {
@@ -2709,8 +2725,12 @@ namespace ReShade { namespace Runtimes
 
 	// -----------------------------------------------------------------------------------------------------
 
-	D3D11Runtime::D3D11Runtime(ID3D11Device *device, IDXGISwapChain *swapchain) : mDevice(device), mSwapChain(swapchain), mImmediateContext(nullptr), mStateBlock(new D3D11StateBlock(device)), mBackBuffer(nullptr), mBackBufferReplacement(nullptr), mBackBufferTexture(nullptr), mBackBufferTextureSRV(), mBackBufferTargets(), mDepthStencil(nullptr), mDepthStencilReplacement(nullptr), mDepthStencilTexture(nullptr), mDepthStencilTextureSRV(nullptr), mLost(true)
+	D3D11Runtime::D3D11Runtime(ID3D11Device *device, IDXGISwapChain *swapchain) : mDevice(device), mSwapChain(swapchain), mImmediateContext(nullptr), mStateBlock(new D3D11StateBlock(device)), mBackBuffer(nullptr), mBackBufferReplacement(nullptr), mBackBufferTexture(nullptr), mBackBufferTextureSRV(), mBackBufferTargets(), mDepthStencil(nullptr), 
+		mDepthStencilReplacement(nullptr), mDepthStencilTexture(nullptr), mDepthStencilTextureSRV(nullptr), 
+		mLost(true), lastMRTsCount(0)
 	{
+		mIsDumpingTrace = false;
+		mToggleDebugViewID = -1;
 		InitializeCriticalSection(&this->mCS);
 
 		assert(this->mDevice != nullptr);
@@ -2766,7 +2786,17 @@ namespace ReShade { namespace Runtimes
 
 		HRESULT hr = this->mSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&this->mBackBuffer));
 
+		// This called several times by MGS, with different resolutions
+		// and RTs are created prior to the resize
+		// BackbufferWidth = desc.BufferDesc.Width;
+		// BackbufferHeight = desc.BufferDesc.Height;
+
 		assert(SUCCEEDED(hr));
+
+		D3D11_TEXTURE2D_DESC texdesc;
+		this->mBackBuffer->GetDesc(&texdesc);
+
+		LOG(INFO) << "Back buffer replacement. Format  " << texdesc.Format;
 
 		if (!CreateBackBufferReplacement(this->mBackBuffer, desc.SampleDesc))
 		{
@@ -2850,14 +2880,17 @@ namespace ReShade { namespace Runtimes
 
 		this->mLost = true;
 	}
+
 	void D3D11Runtime::OnDrawInternal(ID3D11DeviceContext *context, unsigned int vertices)
 	{
 		CSLock lock(this->mCS);
 
 		Runtime::OnDraw(vertices);
 
+		//LOG(INFO) << "Draw: " << vertices;
+
 		ID3D11DepthStencilView *depthstencil = nullptr;
-		context->OMGetRenderTargets(0, nullptr, &depthstencil);
+		//context->OMGetRenderTargets(0, nullptr, &depthstencil);
 
 		if (depthstencil != nullptr)
 		{
@@ -2881,8 +2914,211 @@ namespace ReShade { namespace Runtimes
 			}
 		}
 	}
+
+	void D3D11Runtime::OnExecuteCommandList(ID3D11DeviceContext *context, ID3D11CommandList *pCommandList, BOOL RestoreContextState) {
+		
+		static int drawCounter = 0;
+		
+		drawCounter++;
+
+		if ( mIsDumpingTrace) {
+			LOG(INFO) << "EXEC CL";
+
+			char drawEventString[260];
+			snprintf(drawEventString, 260, "%05d_Draw", drawCounter);
+
+			ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = { nullptr };
+			ID3D11DepthStencilView* depthstencil = nullptr;
+
+			// This doesn't work, always return 0 MRT bound because we're in a deferred context
+			//this->mImmediateContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, &depthstencil);
+			
+			bool depthPresent = false;
+			if (depthstencil != nullptr)
+			{
+				depthPresent = true;
+
+				depthstencil->Release();
+			}
+
+			int RTCount = 0;
+
+			for (auto RT : WatchedRTs)
+			{
+				if (RT) {
+					//LOG(INFO) << "Found RT " << i;
+					RTCount++;
+
+					ID3D11Resource* resource;
+					RT->GetResource(&resource);
+
+					D3D11_RENDER_TARGET_VIEW_DESC texdesc;
+					RT->GetDesc(&texdesc);
+
+					ID3D11Texture2D *texture = nullptr;
+					HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture));
+
+					if (FAILED(hr))
+					{
+						LOG(INFO) << "Was not a texture 2D!";
+						continue;
+					}
+
+					DumpTexture2D( DumpRootPath / drawEventString / (std::string("RT") + std::to_string(RTCount - 1)),  texture);
+
+					SAFE_RELEASE(texture);
+
+				}
+				//SAFE_RELEASE(targets[i]);
+			}
+
+			LOG(INFO) << "Begin CL RT#: " << RTCount << ". Depth:" << ((depthPresent) ? "1" : "0");
+		}
+		else {
+			drawCounter = 0;
+		}
+	}
+
+	void D3D11Runtime::DumpReadableTexture2D(boost::filesystem::path rootPathNoExt, ID3D11Texture2D* texture)
+	{
+		D3D11_TEXTURE2D_DESC desc;
+		texture->GetDesc(&desc);
+
+		LOG(INFO) << "Texture info: " << desc.Width << "x" << desc.Height << " format: " << desc.Format << " Dumping to: " << rootPathNoExt.string();
+
+		ID3D11Texture2D* textureStaging = texture;
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		HRESULT hr = this->mImmediateContext->Map(textureStaging, 0, D3D11_MAP_READ, 0, &mapped);
+
+		if (FAILED(hr))
+		{
+			LOG(TRACE) << "Failed to map staging resource for texture dump! HRESULT is '" << hr << "'.";
+			return;
+		}
+
+		BYTE *pMapped = static_cast<BYTE *>(mapped.pData);
+
+		// Time to save to disk
+		if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+			|| desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			|| desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+			|| desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+			|| desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS)
+
+		{
+			const std::size_t dataSize = desc.Width * desc.Height * 4;
+
+			if (dataSize > 0)
+			{
+				unsigned char* pMem = new unsigned char[dataSize];
+				::memset(pMem, 0, dataSize);
+
+				int* data = (int*)mapped.pData;
+
+				unsigned char* pMemPoint = pMem;
+				unsigned char* pMappedPoint = pMapped;
+
+				// Will save as LDR PNG file
+				const UINT pitch = desc.Width * 4;
+
+				for (UINT y = 0; y < desc.Height; ++y)
+				{
+					CopyMemory(pMemPoint, pMappedPoint, std::min(pitch, static_cast<UINT>(mapped.RowPitch)));
+
+					for (UINT x = 0; x < pitch; x += 4)
+					{
+						pMemPoint[x + 3] = 0xFF;
+
+						if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+							|| desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+							|| desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS)
+						{
+							std::swap(pMemPoint[x + 0], pMemPoint[x + 2]);
+						}
+					}
+
+					pMemPoint += pitch;
+					pMappedPoint += mapped.RowPitch;
+				}
+
+
+				boost::filesystem::path imagePath = rootPathNoExt.string() + ".png";
+				//Make sure parent folder exists
+				boost::system::error_code returnedError;
+				boost::filesystem::create_directories(imagePath.parent_path(), returnedError);
+				//LOG(INFO) << "Dumping image to: " << imagePath.string();
+				//LOG(INFO) << "Width: " << desc.Width << " Height: " << desc.Height;
+				// Dump to disk
+				if (!stbi_write_png(imagePath.string().c_str(), desc.Width, desc.Height, 4, pMem, 0))
+				{
+					LOG(ERROR) << "Failed to write screenshot to " << imagePath.string() << "!";
+				}
+
+				delete[] pMem;
+			}
+
+		}
+
+		this->mImmediateContext->Unmap(textureStaging, 0);
+	}
+
+	void D3D11Runtime::DumpTexture2D(boost::filesystem::path rootPathNoExt,ID3D11Texture2D* texture)
+	{
+		D3D11_TEXTURE2D_DESC desc;
+		texture->GetDesc(&desc);
+
+		//-
+		D3D11_TEXTURE2D_DESC copydesc;
+		ZeroMemory(&copydesc, sizeof(D3D11_TEXTURE2D_DESC));
+		copydesc.Width = desc.Width;
+		copydesc.Height = desc.Height;
+		copydesc.ArraySize = 1;
+		copydesc.MipLevels = 1;
+		copydesc.Format = desc.Format;
+		copydesc.SampleDesc.Count = 1;
+		copydesc.SampleDesc.Quality = 0;
+		copydesc.Usage = D3D11_USAGE_STAGING;
+		copydesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+		ID3D11Texture2D *textureStaging = nullptr;
+		HRESULT hr = this->mDevice->CreateTexture2D(&copydesc, nullptr, &textureStaging); 
+
+		if (FAILED(hr))
+		{
+			LOG(TRACE) << "Failed to create staging resource for texture dump! HRESULT is '" << hr << "'.";
+			return;
+		}
+
+		this->mImmediateContext->CopyResource(textureStaging, texture);
+
+		DumpReadableTexture2D(rootPathNoExt, textureStaging);
+
+		textureStaging->Release();
+	}
+
+	void D3D11Runtime::OnSetMRT(UINT NumViews, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView) 
+	{
+		//if (mIsDumpingTrace) LOG(INFO) << "MRT Count: " << NumViews;
+		lastMRTsCount = NumViews;
+		for (int i = 0; i < NumViews; i++) 
+		{
+			lastMRTs[i] = ppRenderTargetViews[i];
+			//if (mIsDumpingTrace) LOG(INFO) << "View" << i << " " << lastMRTs[i];
+		}
+		lastDepthStencil = pDepthStencilView;
+	}
+
+	static int swapBufferCount = 0;
+
 	void D3D11Runtime::OnPresentInternal()
 	{
+		if (mIsDumpingTrace)
+		{
+			LOG(INFO) << "Trace dump completed.";
+			swapBufferCount--;
+			if (swapBufferCount == 0) mIsDumpingTrace = false;
+		}
+
 		if (this->mLost)
 		{
 			LOG(TRACE) << "Failed to present! Runtime is in a lost state.";
@@ -3448,6 +3684,49 @@ namespace ReShade { namespace Runtimes
 		textureStaging->Release();
 	}
 
+	void D3D11Runtime::DumpFrameTrace(const boost::filesystem::path &path)
+	{
+		LOG(INFO) << "D3D11 - Beginning to dump frame into " << path.string().c_str();
+		DumpRootPath = path;
+		mIsDumpingTrace = true;
+		swapBufferCount = 2;
+	}
+
+	void D3D11Runtime::ToggleDebugView(bool saveCurrent, bool playSave, bool playNext)
+	{
+		//LOG(INFO) << "D3D11 - Entering debug view.";
+		//LOG(INFO) << "D3D11 - Debug RTs watched count " << WatchedRTs.size();
+
+		if (playNext)
+		{
+			mToggleDebugViewID++;
+			if (mToggleDebugViewID > WatchedRTs.size()) mToggleDebugViewID = 0;
+			CurrentSavedView = -1;
+		}
+
+		if (saveCurrent) 
+		{
+			SavedViews.push_back(mToggleDebugViewID);
+			CurrentSavedView = -1;
+			LOG(INFO) << "SavedView " << mToggleDebugViewID;
+		}
+
+		if (playSave)
+		{
+			CurrentSavedView++;
+			if (CurrentSavedView >= SavedViews.size())
+			{
+				CurrentSavedView = -1;
+				mToggleDebugViewID = -1;
+			}
+			else 
+			{
+				mToggleDebugViewID = SavedViews.at(CurrentSavedView);
+			}
+		}
+
+	}
+
 	D3D11Effect::D3D11Effect(std::shared_ptr<const D3D11Runtime> runtime) : mRuntime(runtime), mRasterizerState(nullptr), mConstantsDirty(true)
 	{
 	}
@@ -3696,6 +3975,73 @@ namespace ReShade { namespace Runtimes
 		// Setup shader resources
 		devicecontext->VSSetShaderResources(0, static_cast<UINT>(pass.SRV.size()), pass.SRV.data());
 		devicecontext->PSSetShaderResources(0, static_cast<UINT>(pass.SRV.size()), pass.SRV.data());
+
+		if (ReShade::Runtimes::D3D11Runtime::mToggleDebugViewID >= 0) 
+		{
+			int indexToWatch = ReShade::Runtimes::D3D11Runtime::mToggleDebugViewID;
+			int index = 0;
+			for (auto watchedRT : ReShade::Runtimes::D3D11Runtime::WatchedRTs) 
+			{
+				if (indexToWatch != index) 
+				{
+					index++;
+					continue;
+				}
+				//Found our RT
+				LOG(INFO) << "Overriding RT to backbuffer! Index " << index << " available: " << ReShade::Runtimes::D3D11Runtime::WatchedRTs.size();
+
+				D3D11_SHADER_RESOURCE_VIEW_DESC srvdesc;
+				ZeroMemory(&srvdesc, sizeof(D3D11_SHADER_RESOURCE_VIEW_DESC));
+				srvdesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				srvdesc.Texture2D.MipLevels = 1;
+				srvdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+				ID3D11Resource* resource;
+				watchedRT->GetResource(&resource);
+
+				ID3D11Texture2D *texture = nullptr;
+				HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&texture));
+
+				D3D11_TEXTURE2D_DESC desc;
+				texture->GetDesc(&desc);
+
+				switch (desc.Format)
+				{
+					case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+						srvdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+						break;
+
+					case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+						srvdesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+						break;
+
+					case DXGI_FORMAT_R8_TYPELESS:
+						srvdesc.Format = DXGI_FORMAT_R8_UNORM;
+						break;
+				}
+
+				if (FAILED(hr))
+				{
+					LOG(INFO) << "Was not a texture 2D!";
+					break;
+				}
+
+				ID3D11ShaderResourceView* srv;
+				hr = this->mEffect->mRuntime->mDevice->CreateShaderResourceView(texture, &srvdesc, &srv);
+
+				if (FAILED(hr))
+				{
+					LOG(INFO) << "SRV creation failed! " << hr;
+				}
+				else 
+				{
+					devicecontext->PSSetShaderResources(0, 1, &srv);
+				}
+
+				break;
+
+			}
+		}
 
 		// Setup rendertargets
 		ID3D11DepthStencilView *depthstencil = runtime->mDefaultDepthStencil;

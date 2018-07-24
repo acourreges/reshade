@@ -2,6 +2,7 @@
 
 #include "Effect.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <boost\chrono.hpp>
@@ -11,6 +12,8 @@ struct NVGcontext;
 
 namespace ReShade
 {
+	static std::string CurrentGameFolder;
+
 	class Runtime abstract
 	{
 	public:
@@ -47,6 +50,8 @@ namespace ReShade
 
 		void CreateScreenshot(const boost::filesystem::path &path);
 		virtual void CreateScreenshot(unsigned char *buffer, std::size_t size) const = 0;
+		virtual void DumpFrameTrace(const boost::filesystem::path &path) {}
+		virtual void ToggleDebugView(bool saveCurrent, bool playSave, bool playNext) {}
 
 	protected:
 		unsigned int mWidth, mHeight;

@@ -1,4 +1,10 @@
-#include "Version.h"
+////#include "Version.h"
+#define VERSION_MAJOR 0
+#define VERSION_MINOR 10
+#define VERSION_REVISION 0
+#define VERSION_BUILD 1
+#define VERSION_STRING_FILE "0.10.0"
+#define VERSION_STRING_PRODUCT "0.10.0"
 
 /////////////////////////////////////////////////////////////////////////////
 //
