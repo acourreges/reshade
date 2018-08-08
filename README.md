@@ -7,8 +7,9 @@ The code is branched from the original ReShade 0.10.0 version which has a hookin
 It was extended with more hooks and some logic to capture and dump render targets, extract shader bytecode, toggle some draw calls... 
 It's all very rough around the edges, not much time spent on cleaning it up but here it is if you want to play with it. 
 
-## Install
+## Installation and Prerequisites
 
+- Recommended MGS V version is 1.10. Newer game versions have not been tested. 
 - Setup your game to render in 1280x720 in windowed mode and exit the game
 - Download the release package (`dist` folder in the repository or [GitHub release](https://github.com/acourreges/reshade/releases/)) and extract it into your game folder which should contain the game exe `mgsvtpp.exe`.  
 You will end up with `dxgi.dll`, `Sweet.fx` and `SweetFX` next to your original `mgsvtpp.exe`
